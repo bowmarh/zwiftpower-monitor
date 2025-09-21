@@ -1,71 +1,36 @@
-name: ZwiftPower Monitor
+name: ZwiftPower Monitor — Sanity Check
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
-  check:
+  sanity:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show files (sanity check)
+      - name: Show files in repo root
         run: |
           pwd
           ls -la
           echo "---- .github/workflows ----"
           ls -la .github/workflows || true
 
-      - name: Verify required secrets are present
+      - name: Verify secrets exist
         run: |
           missing=0
           for v in TARGET_URL STORAGE_STATE_B64; do
             if [ -z "${{ secrets[$v] }}" ]; then
               echo "::error::Missing secret: $v"
               missing=1
+            else
+              echo "OK: $v is set"
             fi
           done
-          if [ -z "${{ secrets.WEBHOOK_URL }}" ] && [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ] && [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
-            echo "::warning::No webhook secret set (WEBHOOK_URL or DISCORD_WEBHOOK_URL or SLACK_WEBHOOK_URL). You will not receive notifications."
+          if [ -n "${{ secrets.WEBHOOK_URL }}" ] || [ -n "${{ secrets.DISCORD_WEBHOOK_URL }}" ] || [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "OK: at least one webhook is set"
+          else
+            echo "::warning::No webhook set (WEBHOOK_URL or DISCORD_WEBHOOK_URL or SLACK_WEBHOOK_URL)."
           fi
-          if [ "$missing" -eq 1 ]; then
-            exit 1
-          fi
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
-
-      - name: Restore last hash cache
-        uses: actions/cache@v4
-        with:
-          path: last_hash.txt
-          key: zwiftpower-hash-cache
-
-      - name: Run monitor
-        env:
-          TARGET_URL: ${{ secrets.TARGET_URL }}
-          STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
-          # You can use one or more of these:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          python monitor.py
-
-      - name: Save last hash cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: last_hash.txt
-          key: zwiftpower-hash-cache
+          test "$missing" -eq 0
