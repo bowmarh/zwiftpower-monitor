@@ -21,15 +21,34 @@ def write_storage_state():
         f.write(base64.b64decode(STORAGE_STATE_B64))
 
 def notify(msg: str):
-    """Discord-compatible; for Slack, change payload to {'text': msg}."""
-    if not WEBHOOK_URL:
+    """Send message to both Discord and Slack if URLs are set."""
+    discord_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    slack_url = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+
+    if not discord_url and not slack_url:
         print(f"(No webhook set) {msg}")
         return
-    try:
-        resp = requests.post(WEBHOOK_URL, json={"content": msg}, timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"Failed to send webhook: {e}")
+
+    # Discord
+    if discord_url:
+        try:
+            payload = {"content": msg}
+            resp = requests.post(discord_url, json=payload, timeout=15)
+            resp.raise_for_status()
+            print("✅ Sent to Discord")
+        except Exception as e:
+            print(f"❌ Failed to send to Discord: {e}")
+
+    # Slack
+    if slack_url:
+        try:
+            payload = {"text": msg}
+            resp = requests.post(slack_url, json=payload, timeout=15)
+            resp.raise_for_status()
+            print("✅ Sent to Slack")
+        except Exception as e:
+            print(f"❌ Failed to send to Slack: {e}")
+
 
 def get_first_present_html(page, selectors):
     for sel in selectors:
