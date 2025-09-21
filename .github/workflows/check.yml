@@ -1,36 +1,59 @@
-name: ZwiftPower Monitor — Sanity Check
+name: ZwiftPower Monitor
 
 on:
-  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
+  workflow_dispatch: {}       # allow manual "Run workflow"
 
 jobs:
-  sanity:
+  check:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show files in repo root
+      # Quick sanity check so you can see what's on the runner
+      - name: Show files (sanity)
         run: |
           pwd
           ls -la
           echo "---- .github/workflows ----"
           ls -la .github/workflows || true
 
-      - name: Verify secrets exist
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
         run: |
-          missing=0
-          for v in TARGET_URL STORAGE_STATE_B64; do
-            if [ -z "${{ secrets[$v] }}" ]; then
-              echo "::error::Missing secret: $v"
-              missing=1
-            else
-              echo "OK: $v is set"
-            fi
-          done
-          if [ -n "${{ secrets.WEBHOOK_URL }}" ] || [ -n "${{ secrets.DISCORD_WEBHOOK_URL }}" ] || [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
-            echo "OK: at least one webhook is set"
-          else
-            echo "::warning::No webhook set (WEBHOOK_URL or DISCORD_WEBHOOK_URL or SLACK_WEBHOOK_URL)."
-          fi
-          test "$missing" -eq 0
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      # Cache the last seen hash so we only notify on real changes
+      - name: Restore last hash cache
+        uses: actions/cache@v4
+        with:
+          path: last_hash.txt
+          key: zwiftpower-hash-cache
+
+      - name: Run monitor
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+          STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
+
+          # Any of these may be set (one, two, or all three):
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}                  # generic (Discord-style payload)
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}  # Discord
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}      # Slack
+        run: |
+          python monitor.py
+
+      - name: Save last hash cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: last_hash.txt
+          key: zwiftpower-hash-cache
