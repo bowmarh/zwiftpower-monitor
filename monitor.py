@@ -11,6 +11,7 @@ STORAGE_STATE_B64 = os.environ.get("STORAGE_STATE_B64", "").strip()
 GENERIC_WEBHOOK = os.environ.get("WEBHOOK_URL", "").strip()           # Discord-style payload
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 SLACK_WEBHOOK   = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+TARGET_SELECTOR = os.environ.get("TARGET_SELECTOR", "").strip()
 
 # === Local files (persist via Actions cache) ===
 CACHE_FILE        = "last_hash.txt"
@@ -55,7 +56,7 @@ def notify(markdown_msg: str, plain_msg: str):
             print(f"❌ Failed to send to Slack: {e}")
     if not sent: print("(No webhooks delivered)")
 
-def get_first_present_html(page, selectors):
+def get_table_html_with_rows(page, selectors, extra_wait_s=2.0):
     for sel in selectors:
         try:
             el = page.locator(sel).first
