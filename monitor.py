@@ -4,20 +4,23 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # === Required env ===
-TARGET_URL = os.environ.get("TARGET_URL", "").strip()
+TARGET_URL        = os.environ.get("TARGET_URL", "").strip()
 STORAGE_STATE_B64 = os.environ.get("STORAGE_STATE_B64", "").strip()
 
-# === Optional env (any combination) ===
-GENERIC_WEBHOOK = os.environ.get("WEBHOOK_URL", "").strip()           # Discord-style payload
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-SLACK_WEBHOOK   = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
-TARGET_SELECTOR = os.environ.get("TARGET_SELECTOR", "").strip()
+# === Optional env ===
+# Use this to point at the exact table if you know it, e.g. "table#team_riders"
+TARGET_SELECTOR   = os.environ.get("TARGET_SELECTOR", "").strip()
 
-# === Local files (persist via Actions cache) ===
-CACHE_FILE        = "last_hash.txt"
-SNAPSHOT_HTML     = "last_table.html"
-SNAPSHOT_JSON     = "last_table.json"
-STORAGE_STATE_FILE= "storage_state.json"
+# Any of these can be set; message will be sent to all that exist
+GENERIC_WEBHOOK   = os.environ.get("WEBHOOK_URL", "").strip()           # Discord-style payload
+DISCORD_WEBHOOK   = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+SLACK_WEBHOOK     = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+
+# === Local files (persist via Actions cache for last_hash.txt) ===
+CACHE_FILE          = "last_hash.txt"
+SNAPSHOT_HTML       = "last_table.html"
+SNAPSHOT_JSON       = "last_table.json"
+STORAGE_STATE_FILE  = "storage_state.json"
 
 # === Guards ===
 if not TARGET_URL:
@@ -44,34 +47,42 @@ def notify(markdown_msg: str, plain_msg: str):
     for name, url in (("Generic", GENERIC_WEBHOOK), ("Discord", DISCORD_WEBHOOK)):
         if not url: continue
         try:
-            r = requests.post(url, json=payload_discord, timeout=15); r.raise_for_status()
+            r = requests.post(url, json=payload_discord, timeout=15)
+            r.raise_for_status()
             print(f"✅ Sent to {name}"); sent = True
         except Exception as e:
             print(f"❌ Failed to send to {name}: {e}")
     if SLACK_WEBHOOK:
         try:
-            r = requests.post(SLACK_WEBHOOK, json={"text": plain_msg}, timeout=15); r.raise_for_status()
+            r = requests.post(SLACK_WEBHOOK, json={"text": plain_msg}, timeout=15)
+            r.raise_for_status()
             print("✅ Sent to Slack"); sent = True
         except Exception as e:
             print(f"❌ Failed to send to Slack: {e}")
-    if not sent: print("(No webhooks delivered)")
+    if not sent:
+        print("(No webhooks delivered)")
 
 def get_table_html_with_rows(page, selectors, extra_wait_s=2.0):
+    """
+    Try each selector. For the first visible table, wait until it has at least one <tbody><tr>,
+    then return its innerHTML. If none yield rows, return the first visible HTML as fallback.
+    """
+    first_visible_html = None
     for sel in selectors:
         try:
-            el = page.locator(sel).first
-            el.wait_for(state="visible", timeout=7000)
-            return el.inner_html()
-        except PlaywrightTimeoutError:
-            continue
+            page.locator(sel).first.wait_for(state="visible", timeout=15000)
+            if first_visible_html is None:
+                first_visible_html = page.locator(sel).first.inner_html()
+            page.locator(f"{sel} tbody tr").first.wait_for(state="visible", timeout=15000)
+            time.sleep(extra_wait_s)  # give DataTables/AJAX a moment to finish
+            return page.locator(sel).first.inner_html()
         except Exception:
             continue
-    return page.locator("body").inner_html()
+    return first_visible_html or page.locator("body").inner_html()
 
 def stabilise_html(html: str) -> str:
-    """Remove volatile bits so hash only changes on real content changes."""
+    """Strip volatile attributes so hash only changes on real content changes."""
     s = html
-    # Remove auto-generated ids/data-attrs/timestamps that can change every load
     s = re.sub(r'id="[^"]+"', '', s)
     s = re.sub(r'data-[a-zA-Z0-9\-]+="[^"]+"', '', s)
     s = re.sub(r'datetime="[^"]+"', '', s)
@@ -80,7 +91,7 @@ def stabilise_html(html: str) -> str:
     return s.strip()
 
 def parse_table(html: str):
-    """Return (headers, rows[list of dict]). Key fields like ZID/Name included if present."""
+    """Return (headers, rows[list of dict]). Includes ZID if present in a profile link."""
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if not table:
@@ -95,7 +106,7 @@ def parse_table(html: str):
     rows = []
     body_rows = table.select("tbody tr") or table.select("tr")[1:]
     for tr in body_rows:
-        # get ZID from profile link if present
+        # ZID from profile link if present
         name_link = tr.find("a", href=True)
         zid = ""
         if name_link and "profile.php?z=" in name_link["href"]:
@@ -159,10 +170,10 @@ def diff_rows(prev_rows, curr_rows,
                     changes[f] = (ov, nv)
             if changes:
                 label = r.get("Name") or r.get("ZID") or "(unknown)"
-                # Pretty rank first
                 if "Rank" in changes:
                     ov, nv = changes.pop("Rank")
-                    changes = {"Rank": f"{ov} {rank_arrow(ov,nv)} {nv}", **{k: f"{ov} → {nv}" for k,(ov,nv) in changes.items()}}
+                    changes = {"Rank": f"{ov} {rank_arrow(ov,nv)} {nv}",
+                               **{k: f"{ov} → {nv}" for k,(ov,nv) in changes.items()}}
                 else:
                     changes = {k: f"{ov} → {nv}" for k,(ov,nv) in changes.items()}
                 changed.append((label, changes))
@@ -174,7 +185,6 @@ def diff_rows(prev_rows, curr_rows,
     return {"added": added, "removed": removed, "changed": changed}
 
 def build_messages(url, headers, rows, prev_rows):
-    # Initial snapshot (no previous rows)
     if prev_rows is None:
         md_table = table_to_markdown(headers, rows, max_cols=6, max_rows=15)
         md = f"ZwiftPower initial snapshot:\n{url}\n\n```md\n{md_table}\n```"
@@ -214,7 +224,6 @@ def build_messages(url, headers, rows, prev_rows):
         parts_md.append("\n**Changed**\n```\n" + "\n".join(lines) + "\n```")
         parts_txt.append("\nChanged\n" + "\n".join(lines))
 
-    # Fallback: if parser couldn't classify, send compact table
     if len(parts_md) == 1:
         md_table = table_to_markdown(headers, rows, max_cols=6, max_rows=15)
         parts_md.append("\n```md\n" + md_table + "\n```")
@@ -229,10 +238,15 @@ def build_messages(url, headers, rows, prev_rows):
 def main():
     write_storage_state()
 
-    watched_selectors = [
+    # Build selector priority (prefer your explicit selector if provided)
+    watched_selectors = []
+    if TARGET_SELECTOR:
+        watched_selectors.append(TARGET_SELECTOR)
+    watched_selectors += [
+        "table#team_riders",        # common on team pages
+        "table#events_results_table",
         "table#results",
         "table.dataTable",
-        "#events_results_table",
         "div#content table",
         "table",
     ]
@@ -244,27 +258,21 @@ def main():
         page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
         time.sleep(2.0)
 
-        html = get_first_present_html(page, watched_selectors)
+        html = get_table_html_with_rows(page, watched_selectors)
 
-first_visible_html = None
-    for sel in selectors:
+        # DEBUG: count rows found
         try:
-            page.locator(sel).first.wait_for(state="visible", timeout=15000)
-            if first_visible_html is None:
-                first_visible_html = page.locator(sel).first.inner_html()
-            # wait for at least one row
-            page.locator(f"{sel} tbody tr").first.wait_for(state="visible", timeout=15000)
-            time.sleep(extra_wait_s)  # give DataTables a moment to finish
-            return page.locator(sel).first.inner_html()
+            _rows = len(BeautifulSoup(html, "html.parser").select("tbody tr"))
+            print(f"DEBUG: extracted table rows = {_rows}")
         except Exception:
-            continue
-            
+            pass
+
         # Stabilise before hashing so runs don't spam
         stable = stabilise_html(html)
         current_hash = hashlib.sha256(stable.encode("utf-8")).hexdigest()
         last_hash = open(CACHE_FILE, "r", encoding="utf-8").read().strip() if os.path.exists(CACHE_FILE) else ""
 
-        # Parse table for diffing/messages
+        # Parse for diffing/messages
         headers, rows = parse_table(html)
         prev_rows = None
         if os.path.exists(SNAPSHOT_JSON):
