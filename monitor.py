@@ -134,4 +134,26 @@ def main():
             html_snippet = html
             if len(html_snippet) > 1800:
                 html_snippet = html_snippet[:1800] + "\n...(truncated)..."
-            html_msg = f"ZwiftPower change detected_
+            html_msg = f"ZwiftPower change detected:\n{TARGET_URL}\n\n```html\n{html_snippet}\n```"
+
+            text_snippet = html_to_text(html)
+            if len(text_snippet) > 3500:
+                text_snippet = text_snippet[:3500] + "\n...(truncated)..."
+            text_msg = f"ZwiftPower change detected:\n{TARGET_URL}\n\n{text_snippet}"
+
+            notify(html_msg=html_msg, text_msg=text_msg)
+
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                f.write(h)
+            print("Change detected. Hash & snapshot updated.")
+        else:
+            print("No change.")
+
+        browser.close()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"FATAL: {e}")
+        sys.exit(1)
