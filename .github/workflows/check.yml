@@ -12,6 +12,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Show files (sanity check)
+        run: |
+          pwd
+          ls -la
+          echo "---- .github/workflows ----"
+          ls -la .github/workflows || true
+
+      - name: Verify required secrets are present
+        run: |
+          missing=0
+          for v in TARGET_URL STORAGE_STATE_B64; do
+            if [ -z "${{ secrets[$v] }}" ]; then
+              echo "::error::Missing secret: $v"
+              missing=1
+            fi
+          done
+          if [ -z "${{ secrets.WEBHOOK_URL }}" ] && [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ] && [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "::warning::No webhook secret set (WEBHOOK_URL or DISCORD_WEBHOOK_URL or SLACK_WEBHOOK_URL). You will not receive notifications."
+          fi
+          if [ "$missing" -eq 1 ]; then
+            exit 1
+          fi
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -29,15 +52,16 @@ jobs:
           path: last_hash.txt
           key: zwiftpower-hash-cache
 
-      -      - name: Run monitor
+      - name: Run monitor
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
+          # You can use one or more of these:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           python monitor.py
-
 
       - name: Save last hash cache
         if: always()
