@@ -246,6 +246,19 @@ def main():
 
         html = get_first_present_html(page, watched_selectors)
 
+first_visible_html = None
+    for sel in selectors:
+        try:
+            page.locator(sel).first.wait_for(state="visible", timeout=15000)
+            if first_visible_html is None:
+                first_visible_html = page.locator(sel).first.inner_html()
+            # wait for at least one row
+            page.locator(f"{sel} tbody tr").first.wait_for(state="visible", timeout=15000)
+            time.sleep(extra_wait_s)  # give DataTables a moment to finish
+            return page.locator(sel).first.inner_html()
+        except Exception:
+            continue
+            
         # Stabilise before hashing so runs don't spam
         stable = stabilise_html(html)
         current_hash = hashlib.sha256(stable.encode("utf-8")).hexdigest()
