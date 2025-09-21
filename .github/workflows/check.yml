@@ -2,18 +2,16 @@ name: ZwiftPower Monitor
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (UTC)
-  workflow_dispatch: {}       # allow manual "Run workflow"
+    - cron: "*/15 * * * *"    # every 15 min (UTC)
+  workflow_dispatch: {}        # lets you click "Run workflow"
 
 jobs:
   check:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Quick sanity check so you can see what's on the runner
       - name: Show files (sanity)
         run: |
           pwd
@@ -32,7 +30,6 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      # Cache the last seen hash so we only notify on real changes
       - name: Restore last hash cache
         uses: actions/cache@v4
         with:
@@ -43,11 +40,10 @@ jobs:
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
-
-          # Any of these may be set (one, two, or all three):
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}                  # generic (Discord-style payload)
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}  # Discord
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}      # Slack
+          TARGET_SELECTOR: ${{ secrets.TARGET_SELECTOR }}           # optional, but recommended
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}                   # optional
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}   # optional
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}       # optional
         run: |
           python monitor.py
 
