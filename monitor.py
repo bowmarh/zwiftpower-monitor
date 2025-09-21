@@ -8,11 +8,11 @@ TARGET_URL        = os.environ.get("TARGET_URL", "").strip()
 STORAGE_STATE_B64 = os.environ.get("STORAGE_STATE_B64", "").strip()
 
 # === Optional env ===
-# Use this to point at the exact table if you know it, e.g. "table#team_riders"
+# If you know the exact table on your page, set secret TARGET_SELECTOR, e.g. "table#team_riders"
 TARGET_SELECTOR   = os.environ.get("TARGET_SELECTOR", "").strip()
 
 # Any of these can be set; message will be sent to all that exist
-GENERIC_WEBHOOK   = os.environ.get("WEBHOOK_URL", "").strip()           # Discord-style payload
+GENERIC_WEBHOOK   = os.environ.get("WEBHOOK_URL", "").strip()         # Discord-style
 DISCORD_WEBHOOK   = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 SLACK_WEBHOOK     = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 
@@ -62,19 +62,42 @@ def notify(markdown_msg: str, plain_msg: str):
     if not sent:
         print("(No webhooks delivered)")
 
-def get_table_html_with_rows(page, selectors, extra_wait_s=2.0):
+def get_table_html_with_rows(page, selectors, extra_wait_s=1.5):
     """
     Try each selector. For the first visible table, wait until it has at least one <tbody><tr>,
-    then return its innerHTML. If none yield rows, return the first visible HTML as fallback.
+    (and if DataTables is present, wait for the processing overlay to finish), then return innerHTML.
+    Falls back to the first visible table's HTML if no rows appear.
     """
     first_visible_html = None
     for sel in selectors:
         try:
-            page.locator(sel).first.wait_for(state="visible", timeout=15000)
+            page.locator(sel).first.wait_for(state="visible", timeout=30000)
             if first_visible_html is None:
                 first_visible_html = page.locator(sel).first.inner_html()
-            page.locator(f"{sel} tbody tr").first.wait_for(state="visible", timeout=15000)
-            time.sleep(extra_wait_s)  # give DataTables/AJAX a moment to finish
+
+            # If it's a DataTable, wait for possible "processing" overlay to hide
+            if sel.startswith("table#"):
+                table_id = sel.split("#", 1)[1]
+                proc = page.locator(f"#{table_id}_processing")
+                try:
+                    proc.wait_for(state="visible", timeout=3000)
+                    proc.wait_for(state="hidden", timeout=30000)
+                except:
+                    pass  # overlay might never show; that's fine
+
+            # Wait for rows to actually exist
+            page.wait_for_function(
+                """(sel) => {
+                    const t = document.querySelector(sel);
+                    if (!t) return false;
+                    const rows = t.querySelectorAll('tbody tr');
+                    return rows && rows.length > 0;
+                }""",
+                arg=sel,
+                timeout=30000
+            )
+
+            time.sleep(extra_wait_s)  # give AJAX a moment to finish
             return page.locator(sel).first.inner_html()
         except Exception:
             continue
