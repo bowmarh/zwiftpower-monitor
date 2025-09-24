@@ -12,7 +12,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Show what files actually arrived on the runner
       - name: Show files (sanity)
         run: |
           echo "PWD: $(pwd)"
@@ -20,25 +19,29 @@ jobs:
           echo "---- .github/workflows ----"
           ls -la .github/workflows || true
 
-      # Fail fast if required secrets are missing
+      # Map secrets -> env, then validate in bash (no secrets[$v] indexing)
       - name: Verify required secrets
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+          STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
+          set -e
           missing=0
           for v in TARGET_URL STORAGE_STATE_B64; do
-            if [ -z "${{ secrets[$v] }}" ]; then
+            if [ -z "${!v}" ]; then
               echo "::error::Missing secret: $v"
               missing=1
             else
               echo "OK: $v is set"
             fi
           done
-          if [ "$missing" -ne 0 ]; then
-            exit 1
-          fi
-          # Webhooks are optional, but warn if none present
-          if [ -z "${{ secrets.WEBHOOK_URL }}" ] && [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ] && [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+          if [ -z "$WEBHOOK_URL$DISCORD_WEBHOOK_URL$SLACK_WEBHOOK_URL" ]; then
             echo "::warning::No webhook set (WEBHOOK_URL or DISCORD_WEBHOOK_URL or SLACK_WEBHOOK_URL). You won't receive notifications."
           fi
+          test "$missing" -eq 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -51,7 +54,6 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      # Use the modern restore/save split so "cache save failed" won't appear
       - name: Restore last hash cache
         id: restore-cache
         uses: actions/cache/restore@v4
@@ -63,7 +65,7 @@ jobs:
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
-          TARGET_SELECTOR: ${{ secrets.TARGET_SELECTOR }}           # optional, recommended
+          TARGET_SELECTOR: ${{ secrets.TARGET_SELECTOR }}           # optional
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}                   # optional
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}   # optional
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}       # optional
@@ -73,7 +75,6 @@ jobs:
           echo "Running monitor.py..."
           python monitor.py
 
-      # Only save if there was a cache miss earlier
       - name: Save last hash cache
         if: always() && steps.restore-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
