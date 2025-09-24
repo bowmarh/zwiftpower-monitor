@@ -134,7 +134,7 @@ def parse_table(html: str):
         zid = ""
         if name_link and "profile.php?z=" in name_link["href"]:
             zid = name_link["href"].split("z=")[-1].split("&")[0]
-
+html_msg = f"ZwiftPower change detected:\n{TARGET_URL}\n```html\n{html_snippet}\n```"
         cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td","th"])]
         row = {}
         for i, val in enumerate(cells):
