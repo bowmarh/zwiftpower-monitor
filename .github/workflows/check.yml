@@ -1,9 +1,9 @@
-name: ZwiftPower Monitor
+name: ZwiftPower Monitor (Debug)
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"     # every 15 min UTC
   workflow_dispatch: {}
+  schedule:
+    - cron: "*/15 * * * *"
 
 jobs:
   check:
@@ -19,7 +19,18 @@ jobs:
           echo "---- .github/workflows ----"
           ls -la .github/workflows || true
 
-      # Map secrets -> env, then validate in bash (no secrets[$v] indexing)
+      - name: Verify required files exist
+        run: |
+          set -e
+          for f in monitor.py requirements.txt; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing file: $f (it must be in repo root)"
+              exit 1
+            else
+              echo "OK: $f present"
+            fi
+          done
+
       - name: Verify required secrets
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
@@ -27,6 +38,7 @@ jobs:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TARGET_SELECTOR: ${{ secrets.TARGET_SELECTOR }}
         run: |
           set -e
           missing=0
@@ -35,11 +47,14 @@ jobs:
               echo "::error::Missing secret: $v"
               missing=1
             else
-              echo "OK: $v is set"
+              echo "OK: $v is set (length ${#v})"
             fi
           done
           if [ -z "$WEBHOOK_URL$DISCORD_WEBHOOK_URL$SLACK_WEBHOOK_URL" ]; then
             echo "::warning::No webhook set (WEBHOOK_URL or DISCORD_WEBHOOK_URL or SLACK_WEBHOOK_URL). You won't receive notifications."
+          fi
+          if [ -n "$TARGET_SELECTOR" ]; then
+            echo "Info: TARGET_SELECTOR is set to '$TARGET_SELECTOR'"
           fi
           test "$missing" -eq 0
 
@@ -50,6 +65,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -e
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
@@ -61,19 +77,21 @@ jobs:
           path: last_hash.txt
           key: zwiftpower-hash-cache
 
-      - name: Run monitor
+      - name: Run monitor (debug)
+        id: run-monitor
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
-          TARGET_SELECTOR: ${{ secrets.TARGET_SELECTOR }}           # optional
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}                   # optional
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}   # optional
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}       # optional
+          TARGET_SELECTOR: ${{ secrets.TARGET_SELECTOR }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           set -e
+          set -x
           python --version
           echo "Running monitor.py..."
-          python monitor.py
+          python monitor.py | tee monitor_log.txt
 
       - name: Save last hash cache
         if: always() && steps.restore-cache.outputs.cache-hit != 'true'
@@ -81,3 +99,16 @@ jobs:
         with:
           path: last_hash.txt
           key: zwiftpower-hash-cache
+
+      # If anything failed, upload artifacts to inspect
+      - name: Upload debug artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-debug
+          path: |
+            monitor_log.txt
+            last_table.html
+            last_table.json
+            last_hash.txt
+          if-no-files-found: ignore
