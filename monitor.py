@@ -1,72 +1,91 @@
-import os, base64, hashlib, sys, time, re, json
+import os
+import base64
+import hashlib
+import sys
+import time
+import re
+import json
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # === Required env ===
-TARGET_URL        = os.environ.get("TARGET_URL", "").strip()
+TARGET_URL = os.environ.get("TARGET_URL", "").strip()
 STORAGE_STATE_B64 = os.environ.get("STORAGE_STATE_B64", "").strip()
 
 # === Optional env ===
-# If you know the exact table on your page, set secret TARGET_SELECTOR, e.g. "table#team_riders"
-TARGET_SELECTOR   = os.environ.get("TARGET_SELECTOR", "").strip()
+# e.g. "table#team_riders" or "table#events_results_table"
+TARGET_SELECTOR = os.environ.get("TARGET_SELECTOR", "").strip()
 
 # Any of these can be set; message will be sent to all that exist
-GENERIC_WEBHOOK   = os.environ.get("WEBHOOK_URL", "").strip()         # Discord-style
-DISCORD_WEBHOOK   = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-SLACK_WEBHOOK     = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+GENERIC_WEBHOOK = os.environ.get("WEBHOOK_URL", "").strip()           # Discord-style
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 
-# === Local files (persist via Actions cache for last_hash.txt) ===
-CACHE_FILE          = "last_hash.txt"
-SNAPSHOT_HTML       = "last_table.html"
-SNAPSHOT_JSON       = "last_table.json"
-STORAGE_STATE_FILE  = "storage_state.json"
+# === Local files (persisted via Actions cache for last_hash.txt) ===
+CACHE_FILE = "last_hash.txt"
+SNAPSHOT_HTML = "last_table.html"
+SNAPSHOT_JSON = "last_table.json"
+STORAGE_STATE_FILE = "storage_state.json"
 
 # === Guards ===
 if not TARGET_URL:
-    print("ERROR: TARGET_URL env var is required"); sys.exit(1)
+    print("ERROR: TARGET_URL env var is required")
+    sys.exit(1)
 if not STORAGE_STATE_B64:
-    print("ERROR: STORAGE_STATE_B64 secret missing."); sys.exit(1)
+    print("ERROR: STORAGE_STATE_B64 secret missing.")
+    sys.exit(1)
 if not (GENERIC_WEBHOOK or DISCORD_WEBHOOK or SLACK_WEBHOOK):
     print("WARNING: No webhook set (WEBHOOK_URL / DISCORD_WEBHOOK_URL / SLACK_WEBHOOK_URL).")
 
-def write_storage_state():
+# ------------------ helpers ------------------ #
+
+def write_storage_state() -> None:
+    """Decode base64 cookies into storage_state.json."""
     with open(STORAGE_STATE_FILE, "wb") as f:
         f.write(base64.b64decode(STORAGE_STATE_B64))
 
 def html_to_text(html: str) -> str:
+    """Simple HTML → text (for Slack fallback)."""
     html = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", html)
     html = re.sub(r"(?i)</\s*p\s*>", "\n", html)
     text = re.sub(r"<[^>]+>", "", html)
     text = re.sub(r"[ \t]+\n", "\n", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
-def notify(markdown_msg: str, plain_msg: str):
+def notify(markdown_msg: str, plain_msg: str) -> None:
+    """Send to Discord/generic (content) and Slack (text)."""
     sent = False
+
     payload_discord = {"content": markdown_msg}
     for name, url in (("Generic", GENERIC_WEBHOOK), ("Discord", DISCORD_WEBHOOK)):
-        if not url: continue
+        if not url:
+            continue
         try:
             r = requests.post(url, json=payload_discord, timeout=15)
             r.raise_for_status()
-            print(f"✅ Sent to {name}"); sent = True
+            print(f"✅ Sent to {name}")
+            sent = True
         except Exception as e:
             print(f"❌ Failed to send to {name}: {e}")
+
     if SLACK_WEBHOOK:
         try:
             r = requests.post(SLACK_WEBHOOK, json={"text": plain_msg}, timeout=15)
             r.raise_for_status()
-            print("✅ Sent to Slack"); sent = True
+            print("✅ Sent to Slack")
+            sent = True
         except Exception as e:
             print(f"❌ Failed to send to Slack: {e}")
+
     if not sent:
         print("(No webhooks delivered)")
 
-def get_table_html_with_rows(page, selectors, extra_wait_s=1.5):
+def get_table_html_with_rows(page, selectors, extra_wait_s: float = 1.5) -> str:
     """
     Try each selector. For the first visible table, wait until it has at least one <tbody><tr>,
-    (and if DataTables is present, wait for the processing overlay to finish), then return innerHTML.
-    Falls back to the first visible table's HTML if no rows appear.
+    and if DataTables is present, wait for the 'processing' overlay to hide.
+    Return innerHTML. Fallback to first visible table (header-only) if no rows appear.
     """
     first_visible_html = None
     for sel in selectors:
@@ -75,17 +94,17 @@ def get_table_html_with_rows(page, selectors, extra_wait_s=1.5):
             if first_visible_html is None:
                 first_visible_html = page.locator(sel).first.inner_html()
 
-            # If it's a DataTable, wait for possible "processing" overlay to hide
+            # DataTables: wait for processing overlay if present
             if sel.startswith("table#"):
                 table_id = sel.split("#", 1)[1]
                 proc = page.locator(f"#{table_id}_processing")
                 try:
                     proc.wait_for(state="visible", timeout=3000)
                     proc.wait_for(state="hidden", timeout=30000)
-                except:
-                    pass  # overlay might never show; that's fine
+                except Exception:
+                    pass  # overlay may never show; fine
 
-            # Wait for rows to actually exist
+            # Wait for rows to exist
             page.wait_for_function(
                 """(sel) => {
                     const t = document.querySelector(sel);
@@ -97,14 +116,15 @@ def get_table_html_with_rows(page, selectors, extra_wait_s=1.5):
                 timeout=30000
             )
 
-            time.sleep(extra_wait_s)  # give AJAX a moment to finish
+            time.sleep(extra_wait_s)  # final settle
             return page.locator(sel).first.inner_html()
         except Exception:
             continue
+
     return first_visible_html or page.locator("body").inner_html()
 
 def stabilise_html(html: str) -> str:
-    """Strip volatile attributes so hash only changes on real content changes."""
+    """Strip volatile attrs so hash changes only on real content changes."""
     s = html
     s = re.sub(r'id="[^"]+"', '', s)
     s = re.sub(r'data-[a-zA-Z0-9\-]+="[^"]+"', '', s)
@@ -114,7 +134,7 @@ def stabilise_html(html: str) -> str:
     return s.strip()
 
 def parse_table(html: str):
-    """Return (headers, rows[list of dict]). Includes ZID if present in a profile link."""
+    """Return (headers, rows[list of dict]). Includes ZID if present via profile link."""
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if not table:
@@ -124,7 +144,7 @@ def parse_table(html: str):
     if not headers:
         first_row = table.select_one("tr")
         if first_row:
-            headers = [c.get_text(strip=True) for c in first_row.find_all(["th","td"])]
+            headers = [c.get_text(strip=True) for c in first_row.find_all(["th", "td"])]
 
     rows = []
     body_rows = table.select("tbody tr") or table.select("tr")[1:]
@@ -134,46 +154,56 @@ def parse_table(html: str):
         zid = ""
         if name_link and "profile.php?z=" in name_link["href"]:
             zid = name_link["href"].split("z=")[-1].split("&")[0]
-html_msg = f"ZwiftPower change detected:\n{TARGET_URL}\n```html\n{html_snippet}\n```"
-        cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td","th"])]
+
+        cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
         row = {}
         for i, val in enumerate(cells):
             key = headers[i] if i < len(headers) and headers[i] else f"col_{i+1}"
             row[key] = val
-        if zid: row["ZID"] = zid
+        if zid:
+            row["ZID"] = zid
         rows.append(row)
 
     return headers, rows
 
-def table_to_markdown(headers, rows, max_cols=6, max_rows=15):
+def table_to_markdown(headers, rows, max_cols: int = 6, max_rows: int = 15) -> str:
     headers = headers[:max_cols]
     short_rows = []
     for r in rows[:max_rows]:
         short_rows.append([str(r.get(h, "")) for h in headers])
     md = ""
     if headers:
-        md += " | ".join(headers) + "\n" + " | ".join(["---"]*len(headers)) + "\n"
+        md += " | ".join(headers) + "\n" + " | ".join(["---"] * len(headers)) + "\n"
     for r in short_rows:
         md += " | ".join(r) + "\n"
     return md.strip() or "(no rows)"
 
 def rank_arrow(old_rank: str, new_rank: str) -> str:
-    def to_int(s):
+    def to_int(s: str):
         s = re.sub(r"[^\d]", "", s or "")
         return int(s) if s.isdigit() else None
     o, n = to_int(old_rank), to_int(new_rank)
-    if o is None or n is None: return "→"
-    if n < o: return "↑"
-    if n > o: return "↓"
+    if o is None or n is None:
+        return "→"
+    if n < o:
+        return "↑"
+    if n > o:
+        return "↓"
     return "→"
 
-def diff_rows(prev_rows, curr_rows,
-              key_fields=("ZID","Name"),
-              compare_fields=("Rank","Status","20m w/kg","20m power","15s w/kg","15s power")):
+def diff_rows(
+    prev_rows,
+    curr_rows,
+    key_fields=("ZID", "Name"),
+    compare_fields=("Rank", "Status", "20m w/kg", "20m power", "15s w/kg", "15s power"),
+):
+    """Return dict: {added, removed, changed}.
+       Key is ZID if present, else Name, else whole row."""
     def key_for(r):
         for k in key_fields:
             v = r.get(k, "").strip()
-            if v: return (k, v)
+            if v:
+                return (k, v)
         return ("_row", json.dumps(r, sort_keys=True))
 
     prev_map = {key_for(r): r for r in prev_rows} if prev_rows else {}
@@ -195,11 +225,14 @@ def diff_rows(prev_rows, curr_rows,
                 label = r.get("Name") or r.get("ZID") or "(unknown)"
                 if "Rank" in changes:
                     ov, nv = changes.pop("Rank")
-                    changes = {"Rank": f"{ov} {rank_arrow(ov,nv)} {nv}",
-                               **{k: f"{ov} → {nv}" for k,(ov,nv) in changes.items()}}
+                    ordered = {"Rank": f"{ov} {rank_arrow(ov, nv)} {nv}"}
+                    for k2, (ov2, nv2) in changes.items():
+                        ordered[k2] = f"{ov2} → {nv2}"
+                    changed.append((label, ordered))
                 else:
-                    changes = {k: f"{ov} → {nv}" for k,(ov,nv) in changes.items()}
-                changed.append((label, changes))
+                    changed.append(
+                        (label, {k2: f"{ov2} → {nv2}" for k2, (ov2, nv2) in changes.items()})
+                    )
 
     for k, r in prev_map.items():
         if k not in curr_map:
@@ -207,7 +240,8 @@ def diff_rows(prev_rows, curr_rows,
 
     return {"added": added, "removed": removed, "changed": changed}
 
-def build_messages(url, headers, rows, prev_rows):
+def build_messages(url: str, headers, rows, prev_rows):
+    """Return (markdown_msg, text_msg) for Discord/generic and Slack."""
     if prev_rows is None:
         md_table = table_to_markdown(headers, rows, max_cols=6, max_rows=15)
         md = f"ZwiftPower initial snapshot:\n{url}\n\n```md\n{md_table}\n```"
@@ -222,7 +256,7 @@ def build_messages(url, headers, rows, prev_rows):
         lines = []
         for r in d["added"][:15]:
             nm = r.get("Name") or r.get("ZID") or "(unknown)"
-            rk = r.get("Rank","")
+            rk = r.get("Rank", "")
             lines.append(f"➕ {nm}  {rk}".rstrip())
         parts_md.append("\n**Added**\n```\n" + "\n".join(lines) + "\n```")
         parts_txt.append("\nAdded\n" + "\n".join(lines))
@@ -231,7 +265,7 @@ def build_messages(url, headers, rows, prev_rows):
         lines = []
         for r in d["removed"][:15]:
             nm = r.get("Name") or r.get("ZID") or "(unknown)"
-            rk = r.get("Rank","")
+            rk = r.get("Rank", "")
             lines.append(f"➖ {nm}  {rk}".rstrip())
         parts_md.append("\n**Removed**\n```\n" + "\n".join(lines) + "\n```")
         parts_txt.append("\nRemoved\n" + "\n".join(lines))
@@ -254,14 +288,18 @@ def build_messages(url, headers, rows, prev_rows):
 
     md_msg = "\n".join(parts_md)
     txt_msg = "\n".join(parts_txt)
-    if len(md_msg) > 1900: md_msg = md_msg[:1900] + "\n...(truncated)..."
-    if len(txt_msg) > 3500: txt_msg = txt_msg[:3500] + "\n...(truncated)..."
+    if len(md_msg) > 1900:
+        md_msg = md_msg[:1900] + "\n...(truncated)..."
+    if len(txt_msg) > 3500:
+        txt_msg = txt_msg[:3500] + "\n...(truncated)..."
     return md_msg, txt_msg
 
-def main():
+# ------------------ main ------------------ #
+
+def main() -> None:
     write_storage_state()
 
-    # Build selector priority (prefer your explicit selector if provided)
+    # Selector priority (prefer explicit selector if provided)
     watched_selectors = []
     if TARGET_SELECTOR:
         watched_selectors.append(TARGET_SELECTOR)
@@ -278,24 +316,27 @@ def main():
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(storage_state=STORAGE_STATE_FILE)
         page = context.new_page()
+
         page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
-        time.sleep(2.0)
+        time.sleep(2.0)  # small grace for AJAX/DataTables
 
         html = get_table_html_with_rows(page, watched_selectors)
 
-        # DEBUG: count rows found
+        # DEBUG: row count for visibility in logs
         try:
             _rows = len(BeautifulSoup(html, "html.parser").select("tbody tr"))
             print(f"DEBUG: extracted table rows = {_rows}")
         except Exception:
             pass
 
-        # Stabilise before hashing so runs don't spam
+        # Stable hash (ignore volatile attrs) to avoid spam
         stable = stabilise_html(html)
         current_hash = hashlib.sha256(stable.encode("utf-8")).hexdigest()
-        last_hash = open(CACHE_FILE, "r", encoding="utf-8").read().strip() if os.path.exists(CACHE_FILE) else ""
+        last_hash = ""
+        if os.path.exists(CACHE_FILE):
+            last_hash = open(CACHE_FILE, "r", encoding="utf-8").read().strip()
 
-        # Parse for diffing/messages
+        # Parse for messaging/diff
         headers, rows = parse_table(html)
         prev_rows = None
         if os.path.exists(SNAPSHOT_JSON):
