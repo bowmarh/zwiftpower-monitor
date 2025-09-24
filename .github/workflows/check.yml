@@ -1,4 +1,4 @@
-name: ZwiftPower Monitor (Debug)
+name: ZwiftPower Monitor (Validate → Monitor)
 
 on:
   workflow_dispatch: {}
@@ -6,32 +6,33 @@ on:
     - cron: "*/15 * * * *"
 
 jobs:
-  check:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show files (sanity)
+      - name: Show files
         run: |
           echo "PWD: $(pwd)"
           ls -la
           echo "---- .github/workflows ----"
           ls -la .github/workflows || true
 
-      - name: Verify required files exist
+      - name: Verify repo files exist
         run: |
           set -e
           for f in monitor.py requirements.txt; do
             if [ ! -f "$f" ]; then
-              echo "::error::Missing file: $f (it must be in repo root)"
+              echo "::error::Missing file in repo root: $f"
               exit 1
             else
               echo "OK: $f present"
             fi
           done
 
-      - name: Verify required secrets
+      - name: Map secrets to env
+        id: map
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
@@ -41,29 +42,72 @@ jobs:
           TARGET_SELECTOR: ${{ secrets.TARGET_SELECTOR }}
         run: |
           set -e
-          missing=0
-          for v in TARGET_URL STORAGE_STATE_B64; do
-            if [ -z "${!v}" ]; then
-              echo "::error::Missing secret: $v"
-              missing=1
-            else
-              echo "OK: $v is set (length ${#v})"
-            fi
-          done
+          # Required
+          [ -n "$TARGET_URL" ] || { echo "::error::Missing secret: TARGET_URL"; exit 1; }
+          [ -n "$STORAGE_STATE_B64" ] || { echo "::error::Missing secret: STORAGE_STATE_B64"; exit 1; }
+          echo "OK: TARGET_URL length ${#TARGET_URL}"
+          echo "OK: STORAGE_STATE_B64 length ${#STORAGE_STATE_B64}"
+
+          # Optional webhooks: warn if none
           if [ -z "$WEBHOOK_URL$DISCORD_WEBHOOK_URL$SLACK_WEBHOOK_URL" ]; then
             echo "::warning::No webhook set (WEBHOOK_URL or DISCORD_WEBHOOK_URL or SLACK_WEBHOOK_URL). You won't receive notifications."
+          else
+            echo "OK: at least one webhook is present"
           fi
+
           if [ -n "$TARGET_SELECTOR" ]; then
-            echo "Info: TARGET_SELECTOR is set to '$TARGET_SELECTOR'"
+            echo "Info: TARGET_SELECTOR='$TARGET_SELECTOR'"
+          else
+            echo "Info: TARGET_SELECTOR not set (will auto-detect table)"
           fi
-          test "$missing" -eq 0
+
+          # Write envs to a file for next step
+          {
+            echo "TARGET_URL<<EOF"; echo "$TARGET_URL"; echo "EOF";
+            echo "TARGET_SELECTOR<<EOF"; echo "$TARGET_SELECTOR"; echo "EOF";
+          } >> $GITHUB_OUTPUT
+
+      - name: Setup Python (for decode test)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Decode STORAGE_STATE_B64 and sanity-check JSON
+        env:
+          STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
+        run: |
+          set -e
+          python - <<'PY'
+import os, base64, json, sys
+b64 = os.environ.get("STORAGE_STATE_B64","")
+try:
+    data = base64.b64decode(b64, validate=True)
+except Exception as e:
+    print(f"::error::Failed to base64-decode STORAGE_STATE_B64: {e}")
+    sys.exit(1)
+open("storage_state.json","wb").write(data)
+print("OK: storage_state.json written, size", len(data))
+try:
+    # Not all storage_state files are pure JSON, but validate if so:
+    json.loads(data)
+    print("Info: storage_state.json looks like valid JSON")
+except Exception:
+    print("Info: storage_state.json not strictly JSON (that can be fine)")
+PY
+
+  monitor:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install dependencies + Playwright
         run: |
           set -e
           python -m pip install --upgrade pip
@@ -77,8 +121,7 @@ jobs:
           path: last_hash.txt
           key: zwiftpower-hash-cache
 
-      - name: Run monitor (debug)
-        id: run-monitor
+      - name: Run monitor (verbose)
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
@@ -100,8 +143,7 @@ jobs:
           path: last_hash.txt
           key: zwiftpower-hash-cache
 
-      # If anything failed, upload artifacts to inspect
-      - name: Upload debug artifacts
+      - name: Upload debug artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
