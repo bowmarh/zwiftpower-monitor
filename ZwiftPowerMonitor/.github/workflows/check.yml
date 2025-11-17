@@ -2,45 +2,53 @@ name: ZwiftPower Monitor
 
 on:
   schedule:
+    # every 15 minutes
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    env:
+      TARGET_URL: ${{ secrets.TARGET_URL }}
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
 
-      - name: Restore last hash cache
-        uses: actions/cache@v4
+      # 🔁 This replaces `python -m playwright install --with-deps chromium`
+      - name: Install Playwright browsers (Chromium only)
+        uses: microsoft/playwright-github-action@v1
         with:
-          path: last_hash.txt
-          key: zwiftpower-hash-cache
+          version: "1.47.0"
+          with-deps: true
+          browsers: chromium
 
-      - name: Run monitor
+      - name: Run ZwiftPower monitor
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
         run: |
           python monitor.py
-
-      - name: Save last hash cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: last_hash.txt
-          key: zwiftpower-hash-cache
-
