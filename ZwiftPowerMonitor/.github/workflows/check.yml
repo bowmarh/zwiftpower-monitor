@@ -37,13 +37,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 🔁 This replaces `python -m playwright install --with-deps chromium`
-      - name: Install Playwright browsers (Chromium only)
-        uses: microsoft/playwright-github-action@v1
-        with:
-          version: "1.47.0"
-          with-deps: true
-          browsers: chromium
+      # 🔧 Install Playwright Chromium with a simple retry loop
+      - name: Install Playwright browsers (Chromium)
+        run: |
+          set -e
+          for i in 1 2 3; do
+            echo "Attempt $i to install Playwright Chromium..."
+            python -m playwright install chromium && break
+            echo "Playwright install failed (attempt $i). Retrying in 20 seconds..." >&2
+            if [ "$i" -eq 3 ]; then
+              echo "Playwright install failed after 3 attempts." >&2
+              exit 1
+            fi
+            sleep 20
+          done
 
       - name: Run ZwiftPower monitor
         env:
