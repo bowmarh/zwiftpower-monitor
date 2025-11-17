@@ -1,99 +1,54 @@
 name: ZwiftPower Monitor
 
 on:
-  workflow_dispatch: {}
   schedule:
-    - cron: "*/15 * * * *"   # every 15 min (UTC)
+    # every 15 minutes
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    env:
+      TARGET_URL: ${{ secrets.TARGET_URL }}
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+      STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show files (sanity)
-        run: |
-          echo "PWD: $(pwd)"
-          ls -la
-          echo "---- .github/workflows ----"
-          ls -la .github/workflows || true
-
-      - name: Verify required files exist
-        run: |
-          set -e
-          for f in monitor.py requirements.txt; do
-            if [ ! -f "$f" ]; then
-              echo "::error::Missing file in repo root: $f"
-              exit 1
-            else
-              echo "OK: $f present"
-            fi
-          done
-
-      - name: Verify required secrets
-        env:
-          TARGET_URL: ${{ secrets.TARGET_URL }}
-          STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          TARGET_SELECTOR: ${{ secrets.TARGET_SELECTOR }}
-        run: |
-          set -e
-          missing=0
-          for v in TARGET_URL STORAGE_STATE_B64; do
-            if [ -z "${!v}" ]; then
-              echo "::error::Missing secret: $v"
-              missing=1
-            else
-              echo "OK: $v is set (length ${#v})"
-            fi
-          done
-          if [ -z "$WEBHOOK_URL$DISCORD_WEBHOOK_URL$SLACK_WEBHOOK_URL" ]; then
-            echo "::warning::No webhook set (WEBHOOK_URL or DISCORD_WEBHOOK_URL or SLACK_WEBHOOK_URL)."
-          fi
-          if [ -n "$TARGET_SELECTOR" ]; then
-            echo "Info: TARGET_SELECTOR='$TARGET_SELECTOR'"
-          fi
-          test "$missing" -eq 0
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies + Playwright
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
         run: |
-          set -e
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
 
-      - name: Restore last hash cache
-        id: restore_cache
-        uses: actions/cache/restore@v4
+      # 🔁 This replaces `python -m playwright install --with-deps chromium`
+      - name: Install Playwright browsers (Chromium only)
+        uses: microsoft/playwright-github-action@v1
         with:
-          path: last_hash.txt
-          key: zwiftpower-hash-cache
+          version: "1.47.0"
+          with-deps: true
+          browsers: chromium
 
-      - name: Run monitor (verbose)
+      - name: Run ZwiftPower monitor
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
-          STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
-          TARGET_SELECTOR: ${{ secrets.TARGET_SELECTOR }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
         run: |
-          set -e
-          python --version
-          echo "Running monitor.py..."
           python monitor.py
-
-      - name: Save last hash cache
-        if: ${{ always() && steps.restore_cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: last_hash.txt
-          key: zwiftpower-hash-cache
