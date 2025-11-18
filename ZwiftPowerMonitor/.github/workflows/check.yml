@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,7 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 🔧 Install Playwright Chromium with a simple retry loop
+      # Install Playwright Chromium with retry (no deprecated GitHub Action)
       - name: Install Playwright browsers (Chromium)
         run: |
           set -e
@@ -58,4 +60,4 @@ jobs:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
         run: |
-          python monitor.py
+          python main.py
