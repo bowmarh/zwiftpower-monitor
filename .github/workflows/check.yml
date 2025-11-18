@@ -60,5 +60,4 @@ jobs:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           STORAGE_STATE_B64: ${{ secrets.STORAGE_STATE_B64 }}
         run: |
-          # Replace main.py with your actual entrypoint if different
-          python main.py
+          python monitor.py
