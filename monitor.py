@@ -1,367 +1,139 @@
 import os
 import base64
-import hashlib
-import sys
-import time
-import re
 import json
+import tempfile
+import textwrap
+
 import requests
-from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-# === Required env ===
-TARGET_URL = os.environ.get("TARGET_URL", "").strip()
-STORAGE_STATE_B64 = os.environ.get("STORAGE_STATE_B64", "").strip()
+TARGET_URL = os.environ["TARGET_URL"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+STORAGE_STATE_B64 = os.environ["STORAGE_STATE_B64"]
 
-# === Optional env ===
-# e.g. "table#team_riders" or "table#events_results_table"
-TARGET_SELECTOR = os.environ.get("TARGET_SELECTOR", "").strip()
 
-# Any of these can be set; message will be sent to all that exist
-GENERIC_WEBHOOK = os.environ.get("WEBHOOK_URL", "").strip()           # Discord-style
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+def write_storage_state_file() -> str:
+    """Decode STORAGE_STATE_B64 into a temporary JSON file and return its path."""
+    data = base64.b64decode(STORAGE_STATE_B64)
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return path
 
-# === Local files (persisted via Actions cache for last_hash.txt) ===
-CACHE_FILE = "last_hash.txt"
-SNAPSHOT_HTML = "last_table.html"
-SNAPSHOT_JSON = "last_table.json"
-STORAGE_STATE_FILE = "storage_state.json"
 
-# === Guards ===
-if not TARGET_URL:
-    print("ERROR: TARGET_URL env var is required")
-    sys.exit(1)
-if not STORAGE_STATE_B64:
-    print("ERROR: STORAGE_STATE_B64 secret missing.")
-    sys.exit(1)
-if not (GENERIC_WEBHOOK or DISCORD_WEBHOOK or SLACK_WEBHOOK):
-    print("WARNING: No webhook set (WEBHOOK_URL / DISCORD_WEBHOOK_URL / SLACK_WEBHOOK_URL).")
-
-# ------------------ helpers ------------------ #
-
-def write_storage_state() -> None:
-    """Decode base64 cookies into storage_state.json."""
-    with open(STORAGE_STATE_FILE, "wb") as f:
-        f.write(base64.b64decode(STORAGE_STATE_B64))
-
-def html_to_text(html: str) -> str:
-    """Simple HTML → text (for Slack fallback)."""
-    html = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", html)
-    html = re.sub(r"(?i)</\s*p\s*>", "\n", html)
-    text = re.sub(r"<[^>]+>", "", html)
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
-
-def notify(markdown_msg: str, plain_msg: str) -> None:
-    """Send to Discord/generic (content) and Slack (text)."""
-    sent = False
-
-    payload_discord = {"content": markdown_msg}
-    for name, url in (("Generic", GENERIC_WEBHOOK), ("Discord", DISCORD_WEBHOOK)):
-        if not url:
-            continue
-        try:
-            r = requests.post(url, json=payload_discord, timeout=15)
-            r.raise_for_status()
-            print(f"✅ Sent to {name}")
-            sent = True
-        except Exception as e:
-            print(f"❌ Failed to send to {name}: {e}")
-
-    if SLACK_WEBHOOK:
-        try:
-            r = requests.post(SLACK_WEBHOOK, json={"text": plain_msg}, timeout=15)
-            r.raise_for_status()
-            print("✅ Sent to Slack")
-            sent = True
-        except Exception as e:
-            print(f"❌ Failed to send to Slack: {e}")
-
-    if not sent:
-        print("(No webhooks delivered)")
-
-def get_table_html_with_rows(page, selectors, extra_wait_s: float = 1.5) -> str:
+def scrape_rows(page):
     """
-    Try each selector. For the first visible table, wait until it has at least one <tbody><tr>,
-    and if DataTables is present, wait for the 'processing' overlay to hide.
-    Return innerHTML. Fallback to first visible table (header-only) if no rows appear.
+    Scrape ZwiftPower team table rows.
+
+    Adjust selectors here if ZwiftPower changes layout.
     """
-    first_visible_html = None
-    for sel in selectors:
-        try:
-            page.locator(sel).first.wait_for(state="visible", timeout=30000)
-            if first_visible_html is None:
-                first_visible_html = page.locator(sel).first.inner_html()
+    # Make sure we are on the right page and JS has run
+    page.goto(TARGET_URL, wait_until="networkidle")
 
-            # DataTables: wait for processing overlay if present
-            if sel.startswith("table#"):
-                table_id = sel.split("#", 1)[1]
-                proc = page.locator(f"#{table_id}_processing")
-                try:
-                    proc.wait_for(state="visible", timeout=3000)
-                    proc.wait_for(state="hidden", timeout=30000)
-                except Exception:
-                    pass  # overlay may never show; fine
-
-            # Wait for rows to exist
-            page.wait_for_function(
-                """(sel) => {
-                    const t = document.querySelector(sel);
-                    if (!t) return false;
-                    const rows = t.querySelectorAll('tbody tr');
-                    return rows && rows.length > 0;
-                }""",
-                arg=sel,
-                timeout=30000
-            )
-
-            time.sleep(extra_wait_s)  # final settle
-            return page.locator(sel).first.inner_html()
-        except Exception:
-            continue
-
-    return first_visible_html or page.locator("body").inner_html()
-
-def stabilise_html(html: str) -> str:
-    """Strip volatile attrs so hash changes only on real content changes."""
-    s = html
-    s = re.sub(r'id="[^"]+"', '', s)
-    s = re.sub(r'data-[a-zA-Z0-9\-]+="[^"]+"', '', s)
-    s = re.sub(r'datetime="[^"]+"', '', s)
-    s = re.sub(r'time="[^"]+"', '', s)
-    s = re.sub(r'\s{2,}', ' ', s)
-    return s.strip()
-
-def parse_table(html: str):
-    """Return (headers, rows[list of dict]). Includes ZID if present via profile link."""
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table")
-    if not table:
-        return [], []
-
-    headers = [th.get_text(strip=True) for th in table.select("thead th")]
-    if not headers:
-        first_row = table.select_one("tr")
-        if first_row:
-            headers = [c.get_text(strip=True) for c in first_row.find_all(["th", "td"])]
+    # Try to wait for any ZwiftPower DataTable
+    try:
+        page.wait_for_selector("table.dataTable tbody tr", timeout=15000)
+    except PlaywrightTimeoutError:
+        # Return empty but with some debug context
+        return [], {
+            "title": page.title(),
+            "url": page.url,
+            "note": "Timed out waiting for table.dataTable tbody tr"
+        }
 
     rows = []
-    body_rows = table.select("tbody tr") or table.select("tr")[1:]
-    for tr in body_rows:
-        # ZID from profile link if present
-        name_link = tr.find("a", href=True)
-        zid = ""
-        if name_link and "profile.php?z=" in name_link["href"]:
-            zid = name_link["href"].split("z=")[-1].split("&")[0]
+    for tr in page.query_selector_all("table.dataTable tbody tr"):
+        tds = tr.query_selector_all("td")
+        if not tds:
+            continue
+        cols = [td.inner_text().strip() for td in tds]
+        rows.append(cols)
 
-        cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-        row = {}
-        for i, val in enumerate(cells):
-            key = headers[i] if i < len(headers) and headers[i] else f"col_{i+1}"
-            row[key] = val
-        if zid:
-            row["ZID"] = zid
-        rows.append(row)
+    debug_info = {
+        "title": page.title(),
+        "url": page.url,
+        "rows_found": len(rows),
+    }
+    return rows, debug_info
 
-    return headers, rows
 
-def table_to_markdown(headers, rows, max_cols: int = 6, max_rows: int = 15) -> str:
-    headers = headers[:max_cols]
-    short_rows = []
-    for r in rows[:max_rows]:
-        short_rows.append([str(r.get(h, "")) for h in headers])
-    md = ""
-    if headers:
-        md += " | ".join(headers) + "\n" + " | ".join(["---"] * len(headers)) + "\n"
-    for r in short_rows:
-        md += " | ".join(r) + "\n"
-    return md.strip() or "(no rows)"
+def rows_to_markdown(rows, max_rows=20):
+    """
+    Convert scraped rows into a simple markdown table.
 
-def rank_arrow(old_rank: str, new_rank: str) -> str:
-    def to_int(s: str):
-        s = re.sub(r"[^\d]", "", s or "")
-        return int(s) if s.isdigit() else None
-    o, n = to_int(old_rank), to_int(new_rank)
-    if o is None or n is None:
-        return "→"
-    if n < o:
-        return "↑"
-    if n > o:
-        return "↓"
-    return "→"
+    You may want to customise headers / which columns to show
+    based on the actual ZwiftPower columns.
+    """
+    if not rows:
+        return "(no rows found)"
 
-def diff_rows(
-    prev_rows,
-    curr_rows,
-    key_fields=("ZID", "Name"),
-    compare_fields=("Rank", "Status", "20m w/kg", "20m power", "15s w/kg", "15s power"),
-):
-    """Return dict: {added, removed, changed}.
-       Key is ZID if present, else Name, else whole row."""
-    def key_for(r):
-        for k in key_fields:
-            v = r.get(k, "").strip()
-            if v:
-                return (k, v)
-        return ("_row", json.dumps(r, sort_keys=True))
-
-    prev_map = {key_for(r): r for r in prev_rows} if prev_rows else {}
-    curr_map = {key_for(r): r for r in curr_rows}
-
-    added, removed, changed = [], [], []
-
-    for k, r in curr_map.items():
-        if k not in prev_map:
-            added.append(r)
-        else:
-            old = prev_map[k]
-            changes = {}
-            for f in compare_fields:
-                ov, nv = old.get(f, ""), r.get(f, "")
-                if ov != nv:
-                    changes[f] = (ov, nv)
-            if changes:
-                label = r.get("Name") or r.get("ZID") or "(unknown)"
-                if "Rank" in changes:
-                    ov, nv = changes.pop("Rank")
-                    ordered = {"Rank": f"{ov} {rank_arrow(ov, nv)} {nv}"}
-                    for k2, (ov2, nv2) in changes.items():
-                        ordered[k2] = f"{ov2} → {nv2}"
-                    changed.append((label, ordered))
-                else:
-                    changed.append(
-                        (label, {k2: f"{ov2} → {nv2}" for k2, (ov2, nv2) in changes.items()})
-                    )
-
-    for k, r in prev_map.items():
-        if k not in curr_map:
-            removed.append(r)
-
-    return {"added": added, "removed": removed, "changed": changed}
-
-def build_messages(url: str, headers, rows, prev_rows):
-    """Return (markdown_msg, text_msg) for Discord/generic and Slack."""
-    if prev_rows is None:
-        md_table = table_to_markdown(headers, rows, max_cols=6, max_rows=15)
-        md = f"ZwiftPower initial snapshot:\n{url}\n\n```md\n{md_table}\n```"
-        txt = f"ZwiftPower initial snapshot:\n{url}\n\n{md_table}"
-        return md, txt
-
-    d = diff_rows(prev_rows, rows)
-    parts_md = [f"ZwiftPower change detected:\n{url}"]
-    parts_txt = [f"ZwiftPower change detected:\n{url}"]
-
-    if d["added"]:
-        lines = []
-        for r in d["added"][:15]:
-            nm = r.get("Name") or r.get("ZID") or "(unknown)"
-            rk = r.get("Rank", "")
-            lines.append(f"➕ {nm}  {rk}".rstrip())
-        parts_md.append("\n**Added**\n```\n" + "\n".join(lines) + "\n```")
-        parts_txt.append("\nAdded\n" + "\n".join(lines))
-
-    if d["removed"]:
-        lines = []
-        for r in d["removed"][:15]:
-            nm = r.get("Name") or r.get("ZID") or "(unknown)"
-            rk = r.get("Rank", "")
-            lines.append(f"➖ {nm}  {rk}".rstrip())
-        parts_md.append("\n**Removed**\n```\n" + "\n".join(lines) + "\n```")
-        parts_txt.append("\nRemoved\n" + "\n".join(lines))
-
-    if d["changed"]:
-        lines = []
-        for label, changes in d["changed"][:20]:
-            rank_change = changes.pop("Rank", None)
-            if rank_change:
-                lines.append(f"✳️ {label}: Rank {rank_change}")
-            for k, v in changes.items():
-                lines.append(f"   {k}: {v}")
-        parts_md.append("\n**Changed**\n```\n" + "\n".join(lines) + "\n```")
-        parts_txt.append("\nChanged\n" + "\n".join(lines))
-
-    if len(parts_md) == 1:
-        md_table = table_to_markdown(headers, rows, max_cols=6, max_rows=15)
-        parts_md.append("\n```md\n" + md_table + "\n```")
-        parts_txt.append("\n" + md_table)
-
-    md_msg = "\n".join(parts_md)
-    txt_msg = "\n".join(parts_txt)
-    if len(md_msg) > 1900:
-        md_msg = md_msg[:1900] + "\n...(truncated)..."
-    if len(txt_msg) > 3500:
-        txt_msg = txt_msg[:3500] + "\n...(truncated)..."
-    return md_msg, txt_msg
-
-# ------------------ main ------------------ #
-
-def main() -> None:
-    write_storage_state()
-
-    # Selector priority (prefer explicit selector if provided)
-    watched_selectors = []
-    if TARGET_SELECTOR:
-        watched_selectors.append(TARGET_SELECTOR)
-    watched_selectors += [
-        "table#team_riders",        # common on team pages
-        "table#events_results_table",
-        "table#results",
-        "table.dataTable",
-        "div#content table",
-        "table",
+    # Assume columns: Pos, Name, Category, Points,... etc.
+    # Adapt headers to what ZwiftPower actually shows for your team.
+    header = ["#", "Name", "Category", "Points"]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
     ]
+
+    for idx, row in enumerate(rows[:max_rows], start=1):
+        # Safely extract some columns with fallback
+        name = row[1] if len(row) > 1 else ""
+        category = row[2] if len(row) > 2 else ""
+        points = row[3] if len(row) > 3 else ""
+
+        lines.append(f"| {idx} | {name} | {category} | {points} |")
+
+    if len(rows) > max_rows:
+        lines.append(f"\n_…and {len(rows) - max_rows} more rows_")
+
+    return "\n".join(lines)
+
+
+def send_to_webhook(content: str):
+    if not WEBHOOK_URL:
+        print("WEBHOOK_URL not set; printing message instead:\n")
+        print(content)
+        return
+
+    # Discord-compatible JSON payload; adapt if you’re using Slack/etc.
+    payload = {"content": content}
+    resp = requests.post(WEBHOOK_URL, json=payload, timeout=20)
+    resp.raise_for_status()
+
+
+def main():
+    storage_state_path = write_storage_state_file()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(storage_state=STORAGE_STATE_FILE)
+        context = browser.new_context(storage_state=storage_state_path)
         page = context.new_page()
 
-        page.goto(TARGET_URL, wait_until="networkidle", timeout=60000)
-        time.sleep(2.0)  # small grace for AJAX/DataTables
+        rows, debug = scrape_rows(page)
 
-        html = get_table_html_with_rows(page, watched_selectors)
+        md_table = rows_to_markdown(rows)
 
-        # DEBUG: row count for visibility in logs
-        try:
-            _rows = len(BeautifulSoup(html, "html.parser").select("tbody tr"))
-            print(f"DEBUG: extracted table rows = {_rows}")
-        except Exception:
-            pass
+        message = textwrap.dedent(
+            f"""
+            ZwiftPower snapshot:
+            {TARGET_URL}
 
-        # Stable hash (ignore volatile attrs) to avoid spam
-        stable = stabilise_html(html)
-        current_hash = hashlib.sha256(stable.encode("utf-8")).hexdigest()
-        last_hash = ""
-        if os.path.exists(CACHE_FILE):
-            last_hash = open(CACHE_FILE, "r", encoding="utf-8").read().strip()
+            ```md
+            {md_table}
+            ```
 
-        # Parse for messaging/diff
-        headers, rows = parse_table(html)
-        prev_rows = None
-        if os.path.exists(SNAPSHOT_JSON):
-            try:
-                prev_rows = json.load(open(SNAPSHOT_JSON, "r", encoding="utf-8"))
-            except Exception:
-                prev_rows = None
+            Debug:
+            - Title: {debug.get('title')}
+            - URL: {debug.get('url')}
+            - Rows found: {debug.get('rows_found', 'n/a')}
+            """
+        ).strip()
 
-        if current_hash != last_hash:
-            # Save snapshots
-            open(SNAPSHOT_HTML, "w", encoding="utf-8").write(html)
-            json.dump(rows, open(SNAPSHOT_JSON, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-            open(CACHE_FILE, "w", encoding="utf-8").write(current_hash)
+        send_to_webhook(message)
 
-            md_msg, txt_msg = build_messages(TARGET_URL, headers, rows, prev_rows)
-            notify(markdown_msg=md_msg, plain_msg=txt_msg)
-            print("Change detected. Stable hash & snapshots updated.")
-        else:
-            print("No change.")
-
+        context.close()
         browser.close()
 
+
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"FATAL: {e}")
-        sys.exit(1)
+    main()
